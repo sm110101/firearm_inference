@@ -1,0 +1,795 @@
+---
+title: "Class Project"
+author: "Sean Morris"
+date: "2023-12-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list=ls())
+setwd("~/Desktop/regression/Class Project")
+```
+
+
+```{r}
+# Packages
+#install.packages("tidyverse")
+#install.packages("readxl")
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(car)
+```
+
+## Data Pre-processing - Ownership Data ##
+```{r}
+# Gun-ownership db
+ownership_init = read_xlsx("data/firearm_ownership.xlsx", sheet = "dataset")
+
+# Dropping unncessecary variables
+ownership_init = ownership_init[, -c(1, 5, 8:20)]
+ownership_init = ownership_init %>% rename(prop_owners = HFR)
+
+# Calculating National Average for visualization purposes
+nat_avg_prop_owners = ownership_init %>% 
+                   group_by(Year) %>% 
+                   summarize(nat_avg_prop_owners = mean(prop_owners, na.rm = TRUE))
+
+# Now filtering out all states besides CA, NC, & TX
+ownership = ownership_init %>% 
+                      filter(STATE %in% c("California", "North Carolina", "Texas"))
+# Adding Yearly Average
+ownership = ownership %>%
+   left_join(nat_avg_prop_owners, by = "Year")
+```
+
+## Data Pre-processing - Gun Laws Data ##
+```{r}
+# Gun Laws db
+laws_init = read_xlsx("data/firearm_laws.xlsx", sheet = "dataset")
+# Dropping unnecessary variables
+laws_init = laws_init[, -c(1,3:5,8,11,12,14:27)]
+# Now filtering out all states besides CA, NC, & TX
+laws_init = laws_init %>%
+  filter(State %in% c("California", "North Carolina", "Texas"))
+# Filtering by law class, effect (restrictive), and implementation
+laws_init = laws_init %>%
+  filter(laws_init$`Law Class` %in% c("carrying a concealed weapon (ccw)", "child access laws", "permit to purchase"))
+
+laws_init = laws_init %>%
+  filter(laws_init$Effect %in% c("Restrictive"))
+
+laws_init = laws_init %>%
+  filter(laws_init$`Type of Change` %in% c("Implement"))
+# Filtering by years that fall in other dataframe (1980-2016)
+laws <- laws_init %>%
+  filter(`Effective Date Year` >= 1980)
+```
+
+## Data Pre-processing - Merging Predictors Data ##
+```{r}
+# Changing Varnames before joining
+ownership = ownership %>% rename(State = STATE)
+laws = laws %>% rename(Year = `Effective Date Year`)
+
+# Joining together dataframes, while binary-encoding for years before and after the child law is implemented in 'laws'
+child_law_years = laws %>%
+  filter(`Law Class` == "child access laws") %>%
+  select(State, Year)
+
+generate_child_dummy = function(year, state, child_law_years) {
+  # Check if state exists in child_law_years
+  if (state %in% child_law_years$State) {
+    # Get the year of law implementation
+    law_year = child_law_years %>%
+      filter(State == state) %>%
+      pull(Year)
+    # Compare the year from 'ownership' with the year from 'law'
+    return(ifelse(year >= law_year, 1, 0))
+  } else {
+    # If state not found, return 0
+    return(0)
+  }
+}
+
+# Applying function to each row in "ownership"
+ownership$child = mapply(generate_child_dummy,
+                         ownership$Year,
+                         ownership$State,
+                         MoreArgs = list(child_law_years = child_law_years))
+
+# Creating final regressor df, "guns" 
+guns = ownership %>%
+  select(Year, State, prop_owners, nat_avg_prop_owners, everything())
+```
+
+
+## Data Pre-processing - Gun violence database ##
+```{r}
+v_1980_to_1998 = read.table("data/v_1980-1998.txt", header = TRUE, sep = "\t", quote = "", fill = TRUE)
+v_1999_to_2016 = read.table("data/v_1999-2016.txt", header = TRUE, sep = "\t", quote = "", fill = TRUE)
+
+# Dropping "notes" Column
+v_1980_to_1998 <- v_1980_to_1998 %>% select(-X.Notes.)
+v_1999_to_2016 <- v_1999_to_2016 %>% select(-X.Notes.)
+
+# Dropping NA rows
+v_1980_to_1998 <- v_1980_to_1998 %>% 
+  filter(!is.na(X.State.) & X.State. != "")
+v_1999_to_2016 <- v_1999_to_2016 %>% 
+  filter(!is.na(X.State.) & X.State. != "")
+
+# Making sure there are no more null entries
+cat(any(is.na(v_1980_to_1998)),any(is.na(v_1999_to_2016)))
+
+# Dropping unecessary variables 
+v_1980_to_1998 = v_1980_to_1998[, -c(2,4:6)]
+v_1999_to_2016 = v_1999_to_2016[, -c(2,4:6)]
+
+
+# Checking Unique Age Identifiers before aggregating
+unique(v_1980_to_1998$X.Age.Group.)
+unique(v_1999_to_2016$X.Age.Group.)
+  # Looks like there is an entry called "Not Stated" in 1980-1998 data - lets drop it 
+v_1980_to_1998 <- v_1980_to_1998 %>%
+  filter(X.Age.Group. != "\"Not Stated\"")
+  # Checking again
+unique(v_1980_to_1998$X.Age.Group.)
+
+
+# Reconstructing Dataframes to get single-year rows for modelling
+through_1998 = v_1980_to_1998
+through_2016 = v_1999_to_2016
+  # Categorizing minors and adults
+through_1998 <- through_1998 %>%
+  mutate(Age_Category = case_when(
+    str_trim(X.Age.Group.) %in% c("\"< 1 year\"", "\"1-4 years\"", "\"5-9 years\"", "\"10-14 years\"", "\"15-19 years\"") ~ "minors",
+    TRUE ~ "adults"
+  ))
+through_2016 <- through_2016 %>%
+  mutate(Age_Category = case_when(
+    str_trim(X.Age.Group.) %in% c("\"< 1 year\"", "\"1-4 years\"", "\"5-9 years\"", "\"10-14 years\"", "\"15-19 years\"") ~ "minors",
+    TRUE ~ "adults"
+  ))
+
+# Converting 'Population' column to numeric, handling non-numeric entries
+through_1998$Population <- as.numeric(gsub("\"", "", through_1998$Population))
+through_2016$Population <- as.numeric(gsub("\"", "", through_2016$Population))
+
+# Also convert the 'Deaths' column to numeric if it's not already
+through_1998$Deaths <- as.numeric(gsub("\"", "", through_1998$Deaths))
+through_2016$Deaths <- as.numeric(gsub("\"", "", through_2016$Deaths))
+
+# Creating Population and Death dfs by state, year, and age category in order to calculate rates later
+pop_1998 = through_1998 %>%
+  select(X.State., X.Year., Population, Age_Category) %>%
+  distinct() %>%
+  group_by(X.State., X.Year., Age_Category) %>%
+  summarize(
+    total_population = sum(Population, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+pop_2016 = through_2016 %>%
+  select(X.State., X.Year., Population, Age_Category) %>%
+  distinct() %>%
+  group_by(X.State., X.Year., Age_Category) %>%
+  summarize(
+    total_population = sum(Population, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+pop_1998_wide = pop_1998 %>%
+  pivot_wider(
+    id_cols = c(X.State., X.Year.),
+    names_from = Age_Category,
+    values_from = total_population,
+    names_prefix = "total_",
+    names_sep = "_"
+  )
+
+pop_2016_wide = pop_2016 %>%
+  pivot_wider(
+    id_cols = c(X.State., X.Year.),
+    names_from = Age_Category,
+    values_from = total_population,
+    names_prefix = "total_",
+    names_sep = "_"
+  )
+
+death_1998 = through_1998 %>%
+  group_by(X.State., X.Year., X.Injury.Intent., Age_Category) %>%
+  summarize(
+    deaths = sum(Deaths, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+death_2016 = through_2016 %>%
+  group_by(X.State., X.Year., X.Injury.Intent., Age_Category) %>%
+  summarize(
+    deaths = sum(Deaths, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+through_1998_aggregate = left_join(death_1998, pop_1998, by = c("X.State.", "X.Year.", "Age_Category"))
+through_2016_aggregate = left_join(death_2016, pop_2016, by = c("X.State.", "X.Year.", "Age_Category"))
+
+through_1998_aggregate = through_1998_aggregate %>%
+  mutate(
+    rate_per_100k = (deaths / total_population) * 100000
+  )
+
+through_2016_aggregate = through_2016_aggregate %>%
+  mutate(
+    rate_per_100k = (deaths / total_population) * 100000
+  )
+
+# Creating aggregate DF
+through_1998_aggregate = through_1998 %>%
+  group_by(X.State., X.Year., X.Injury.Intent., Age_Category) %>%
+  summarize(
+    deaths = sum(Deaths, na.rm = TRUE),
+    population = sum(Population, na.rm = TRUE),
+    rate_per_100k = (sum(Deaths, na.rm = TRUE) / sum(Population, na.rm = TRUE)) * 100000,
+    .groups = 'drop'
+  )
+
+through_2016_aggregate = through_2016 %>%
+  group_by(X.State., X.Year., X.Injury.Intent., Age_Category) %>%
+  summarize(
+    deaths = sum(Deaths, na.rm = TRUE),
+    population = sum(Population, na.rm = TRUE),
+    rate_per_100k = (sum(Deaths, na.rm = TRUE) / sum(Population, na.rm = TRUE)) * 100000,
+    .groups = 'drop'
+  )
+
+
+
+# Pivoting
+through_1998_aggregate_wide = through_1998_aggregate %>%
+  pivot_wider(
+    id_cols = c(X.State., X.Year.),
+    names_from = c(X.Injury.Intent., Age_Category),
+    values_from = c(deaths, rate_per_100k),
+    names_sep = "_"
+  )
+
+through_2016_aggregate_wide = through_2016_aggregate %>%
+  pivot_wider(
+    id_cols = c(X.State., X.Year.),
+    names_from = c(X.Injury.Intent., Age_Category),
+    values_from = c(deaths, rate_per_100k),
+    names_sep = "_"
+  )
+
+  # replacing NA values with 0, mostly for unintended deaths, which did not occur in certain years
+through_1998_aggregate_wide[] <- lapply(through_1998_aggregate_wide, function(x) ifelse(is.na(x), 0, x))
+through_2016_aggregate_wide[] <- lapply(through_2016_aggregate_wide, function(x) ifelse(is.na(x), 0, x))
+
+
+# Some housekeeping with variable names and dtypes
+through_1998_aggregate_wide = through_1998_aggregate_wide %>%
+  rename(State = X.State., Year = X.Year.) %>%
+  mutate(
+    State = gsub("\"", "", State),
+    Year = as.numeric(gsub("\"", "", Year))
+  )
+
+through_2016_aggregate_wide = through_2016_aggregate_wide %>%
+  rename(State = X.State., Year = X.Year.) %>%
+  mutate(
+    State = gsub("\"", "", State),
+    Year = as.numeric(gsub("\"", "", Year))
+  )
+
+# Combining violence Data
+violence_init = bind_rows(through_1998_aggregate_wide, through_2016_aggregate_wide)
+violence = violence_init %>%
+  arrange(State, Year)
+
+# Dealing with Null values again
+violence[] <- lapply(violence, function(x) ifelse(is.na(x), 0, x))
+
+
+#### Adding back population variables ####
+# First fixing varnames and dtypes
+pop_1998_wide = pop_1998_wide %>%
+  rename(State = X.State., Year = X.Year.) %>%
+  mutate(
+    State = gsub("\"", "", State),
+    Year = as.numeric(gsub("\"", "", Year))
+  )
+
+pop_2016_wide = pop_2016_wide %>%
+  rename(State = X.State., Year = X.Year.) %>%
+  mutate(
+    State = gsub("\"", "", State),
+    Year = as.numeric(gsub("\"", "", Year))
+  )
+
+# Adding total population variable to each 
+pop_1998_wide <- pop_1998_wide %>%
+  mutate(total_pop = total_adults + total_minors)
+
+pop_2016_wide <- pop_2016_wide %>%
+  mutate(total_pop = total_adults + total_minors)
+
+# Combining
+population = bind_rows(pop_1998_wide, pop_2016_wide)
+population = population %>%
+  arrange(State, Year)
+```
+
+
+## Data Pre-processing - Baseline Dataframe ##
+```{r}
+data_init = left_join(guns, violence, by = c("State", "Year"))
+data = data_init %>%
+  left_join(population, by = c("State", "Year"))
+
+data <- data %>%
+  rename(
+    adult_homicides = `deaths_"Homicide"_adults`,
+    minor_homicides = `deaths_"Homicide"_minors`,
+    adult_suicides = `deaths_"Suicide"_adults`,
+    minor_suicides = `deaths_"Suicide"_minors`,
+    adult_unintentionals = `deaths_"Unintentional "_adults`,
+    minor_unintentionals = `deaths_"Unintentional "_minors`,
+    adult_homicide_rate = `rate_per_100k_"Homicide"_adults`,
+    minor_homicide_rate = `rate_per_100k_"Homicide"_minors`,
+    adult_suicide_rate = `rate_per_100k_"Suicide"_adults`,
+    minor_suicide_rate = `rate_per_100k_"Suicide"_minors`,
+    adult_unintentional_rate = `rate_per_100k_"Unintentional "_adults`,
+    minor_unintentional_rate = `rate_per_100k_"Unintentional "_minors`
+  )
+
+data = data[, -c(20:23)]
+
+data <- data %>%
+  mutate(
+    total_homicides = adult_homicides + minor_homicides,
+    total_suicides = adult_suicides + minor_suicides,
+    total_unintentionals = adult_unintentionals + minor_unintentionals,
+    total_homicide_rate = (total_homicides / total_pop) * 100000,
+    total_suicide_rate = (total_suicides / total_pop) * 100000,
+    total_unintentional_rate = (total_unintentionals / total_pop) * 100000)
+
+```
+
+## Data Pre-processing - Additional Variables ##
+```{r}
+employment = read_xls('data/UNRATE_1980_2016.xls', sheet = 'dataset')
+data = left_join(data, employment, by = c("Year"))
+single_parents = read_xls('data/single_parent_1980_2016.xls', sheet = 'dataset')
+
+data = left_join(data, single_parents, by = c("Year"))
+
+#data_trunc = data %>%
+#  filter(Year >= 1999)
+#
+#full_data = left_join(data_trunc, employment, by = c("State", "Year"))
+```
+
+
+## EDA - Visualization 1 ##
+```{r}
+p = ggplot(data, aes(x=Year, y = prop_owners, color = State)) +
+  geom_line() +
+  theme_minimal() +
+  labs(title = "Proportion of Gun Owners By State",
+       x = "Year",
+       y = "% of Population Owning a Firearm") +
+  scale_color_brewer(palette = "Set1")
+
+p + geom_line(data=data %>% distinct(Year, nat_avg_prop_owners),
+              aes(x = Year, y = nat_avg_prop_owners, color = "National Average"),
+              linetype = "dashed")
+```
+
+## EDA - Visualization 2 ##
+
+```{r}
+ratio <- max(data$total_homicide_rate) / max(data$prop_owners)
+
+ggplot(data, aes(x = Year)) +
+  geom_line(aes(y = total_homicide_rate, color = "Homicide Rate"), size = 1) +
+  geom_line(aes(y = prop_owners * ratio, color = "% of Gun Owners"), size = 1) +
+  facet_wrap(~ State) +
+  labs(title = "Total Homicide Rate and \nProportion of Gun Owners Over Time by State",
+       x = "Year",
+       y = "Total Homicide Rate") +
+  scale_y_continuous(
+    # Primary axis
+    name = "Total Homicide Rate",
+    sec.axis = sec_axis(~ . / ratio, name = "Proportion of Gun Owners")  # Secondary axis
+  ) +
+  scale_color_manual(values = c("Homicide Rate" = "red", "% of Gun Owners" = "blue")) +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_text(color = "red"), 
+        axis.title.y.right = element_text(color = "blue")  
+  )
+
+```
+
+## EDA - Visualization 3 ##
+
+```{r}
+ratio <- max(data$total_suicide_rate) / max(data$prop_owners)
+
+ggplot(data, aes(x = Year)) +
+  geom_line(aes(y = total_suicide_rate, color = "Suicide Rate"), size = 1) +
+  geom_line(aes(y = prop_owners * ratio, color = "% of Gun Owners"), size = 1) +
+  facet_wrap(~ State) +
+  labs(title = "Total Suicide Rate and \nProportion of Gun Owners Over Time by State",
+       x = "Year",
+       y = "Total Suicide Rate",
+       fill = "Metric") +
+  scale_y_continuous(
+    # Primary axis
+    name = "Total Suicide Rate",
+    sec.axis = sec_axis(~ . / ratio, name = "Proportion of Gun Owners")  # Secondary axis
+  ) +
+  scale_color_manual(values = c("Suicide Rate" = "orange", "% of Gun Owners" = "blue")) +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_text(color = "orange"), 
+        axis.title.y.right = element_text(color = "blue")  
+  )
+```
+
+
+## EDA - Visualization 4 ##
+```{r}
+ggplot(data, aes(x = Year)) +
+  geom_col(aes(y = adult_suicides, fill = "adult_suicides"), position = "stack") +
+  geom_col(aes(y = minor_suicides, fill = "minor_suicides"), position = "stack") +
+  facet_wrap(~ State) +
+  labs(title = "Suicides by Age Group Over Time by State",
+       x = "Year",
+       y = "Number of Suicides",
+       fill = "Age Group") +
+  scale_fill_manual(values = c("adult_suicides" = "blue", "minor_suicides" = "red")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))  # Rotate x-axis labels for readability
+
+```
+
+## EDA - Visualization 5 ##
+```{r}
+ggplot(data, aes(x = Year)) +
+  geom_col(aes(y = adult_homicides, fill = "adult_homicides"), position = "stack") +
+  geom_col(aes(y = minor_homicides, fill = "minor_homicides"), position = "stack") +
+  facet_wrap(~ State) +
+  labs(title = "Homicides by Age Group Over Time by State",
+       x = "Year",
+       y = "Number of Homicides",
+       fill = "Age Group") +
+  scale_fill_manual(values = c("adult_homicides" = "blue", "minor_homicides" = "red")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))  # Same as above
+
+```
+
+## EDA - Visaulization 6 ##
+```{r}
+# Create the plot grid with homicide_rate and add pct_change_employment as points
+ggplot(data, aes(x = Year)) +
+  geom_line(aes(y = total_homicide_rate, group = State, color = "Homicide Rate"), size = 1) +
+  geom_line(aes(y = urate, color = "Unemployment Rate"), size = 0.5) +
+  facet_wrap(~ State, scales = 'free_y') +
+  labs(title = "Homicide Rates and National Unemployment",
+       x = "Year",
+       y = "Metric",
+       color = "Metric") +
+  scale_color_manual(values = c("Homicide Rate" = "red", "Unemployment Rate" = "black")) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## EDA - Visualization 7 ##
+```{r}
+# Create the plot grid with homicide_rate and add pct_change_employment as points
+ggplot(data, aes(x = Year)) +
+  geom_line(aes(y = total_suicide_rate, group = State, color = "Suicide Rate"), size = 1) +
+  geom_line(aes(y = urate, color = "Unemployment Rate"), size = 0.5) +
+  facet_wrap(~ State, scales = 'free_y') +
+  labs(title = "Suicide Rates and National Unemployment",
+       x = "Year",
+       y = "Metric",
+       color = "Metric") +
+  scale_color_manual(values = c("Suicide Rate" = "orange", "Unemployment Rate" = "black")) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## EDA - Looking at each variable's log-transform
+```{r}
+for(state in c("California", "North Carolina", "Texas")) {
+  for(variable in c("prop_owners", "total_homicide_rate", "total_suicide_rate", "total_unintentional_rate")) {
+    state_data <- data[data$State == state, ]
+    if (nrow(state_data) > 0) {
+      state_data$log_variable <- log(state_data[[variable]])  
+
+      p <- ggplot(state_data, aes_string(x = "Year")) +
+        geom_line(aes_string(y = variable, colour = "'Original'")) +
+        geom_line(aes(y = log_variable, colour = "'Log-Transformed'")) +
+        labs(title = paste("Variable:", variable, "in", state), y = "Value", colour = "Legend") +
+        theme_minimal()
+      print(p)
+    }
+  }
+}
+
+
+
+```
+```{r}
+for(variable in c("urate", "total_single_parent")) {
+  data$log_variable <- log(data[[variable]])  
+
+  p <- ggplot(data, aes_string(x = "Year")) +
+    geom_line(aes_string(y = variable, colour = "'Original'")) +
+    geom_line(aes(y = log_variable, colour = "'Log-Transformed'")) +
+    labs(title = paste("Variable:", variable), y = "Value", colour = "Legend") +
+    theme_minimal()
+
+  print(p) 
+}
+```
+
+From this info above - I will elect to use log-transforms of the respective homicide/suicide/unintentional rates, as well as the log of unemployment, while keeping single_parent children and prop_owners the same. 
+
+## Pre-Modelling Tests
+```{r}
+# Testing for non-stationarity 
+#install.packages("tseries")
+#install.packages("lmtest")
+#install.packages("sandwich")
+#install.packages("plm")
+library(tseries)
+library(lmtest)
+library(sandwich)
+library(plm)
+
+adf.test(log(data$total_homicide_rate)) #Non-stationary
+adf.test(log(data$total_suicide_rate)) #Non-stationary
+adf.test(data$prop_owners) #Non-stationary
+adf.test(log(data$urate)) #Stationary
+adf.test(data$total_single_parent) #Non-stationary
+```
+
+
+## Model A - Testing Policy impact of permit to purchase on total suicide rates by state 
+```{r}
+model1_df <- data %>%
+  select(Year, State, prop_owners, permit, adult_suicide_rate, minor_suicide_rate,
+         total_suicide_rate, urate, total_single_parent, single_mother, single_father)
+
+model_0 = lm(total_suicide_rate ~ permit + urate + total_single_parent, data = model1_df)
+print((summary(model_0)))
+# Problem - Our variables are non-stationary, and since we are working with panel data it would be wise to use clustered standard errors as well. Finally, lets log-transform our variables to better smooth them out. 
+
+#Log-transforming and differencing variables
+model1_df <- model1_df %>%
+  mutate(log_total_suicide_rate = log(total_suicide_rate),
+         log_prop_owners = log(prop_owners),
+         log_urate = log(urate),
+         log_total_single_parent = log(total_single_parent),
+         diff_log_total_suicide_rate = c(NA, diff(log_total_suicide_rate)),
+         diff_log_prop_owners = c(NA, diff(log_prop_owners)),
+         diff_log_urate = c(NA, diff(log_urate)),
+         diff_log_total_single_parent = c(NA, diff(log_total_single_parent)))
+
+# Running a log-log model with no differences
+model_1 = lm(log_total_suicide_rate ~
+               permit + 
+               log_prop_owners + 
+               log_urate + 
+               log_total_single_parent, 
+               data = model1_df)
+print((summary(model_1)))
+
+    # Looking better, but I will now add clustered standard errors to account for any group-dependence
+cluster_se <- coeftest(model_1, vcov = vcovHC(model_1, type = "HC1", cluster = "group", group = model1_df$State))
+print(cluster_se)
+
+# ok, now lets run the same regression using first differences of each non-stationary variable
+model_2 = lm(diff_log_total_suicide_rate ~ 
+               permit +
+               diff_log_prop_owners +
+               log_urate +
+               diff_log_total_single_parent,
+             data = model1_df)
+print((summary(model_2)))
+
+  # Now with clustered SEs
+cluster_se2 <- coeftest(model_2, vcov = vcovHC(model_2, type = "HC1", cluster = "group", group = model1_df$State))
+print(cluster_se2)
+
+
+
+# Looks like model 1 performs the best.
+```
+```{r}
+
+```
+
+
+## Model A - Visualized 
+```{r}
+# Calculate fitted values
+model1_df$fitted_values = fitted(model_1)
+
+# Plotting
+ggplot(model1_df, aes(x = log(total_suicide_rate), y = fitted_values)) +
+  geom_point(aes(color = State), alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ State) +  # Separate plots for each state
+  labs(title = "Actual vs Fitted Log(Total Suicide Rate) by State",
+       x = "Log of Actual Total Suicide Rate",
+       y = "Fitted Values",
+       color = "State") +
+  theme_minimal()
+```
+
+## Model A - Testing for multicollinearity 
+```{r}
+vif(model_1)
+```
+
+## Model A - Looking for potential heteroskedasticity
+```{r}
+model1_df$std_residuals = rstandard(model_1)
+
+ggplot(model1_df, aes(x = log(prop_owners), y = std_residuals)) +
+  geom_point(aes(color = State), alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype='dashed', color='red') +
+  facet_wrap(~ State) +
+  labs(title = "Standardized Residuals vs Log(Prop Owners) by State",
+       x = "Log(Prop Owners)",
+       y = "Standardized Residuals",
+       color = "State") +
+  theme_minimal()
+```
+```{r}
+ggplot(model1_df, aes(x = log(urate), y = std_residuals)) +
+  geom_point(aes(), alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype='dashed', color='red') +
+  labs(title = "Standardized Residuals vs Log(urate)",
+       x = "Log of Unemployment Rate",
+       y = "Standardized Residuals") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(model1_df, aes(x = log(total_single_parent), y = std_residuals)) +
+  geom_point(aes(), alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype='dashed', color='red') +
+  labs(title = "Standardized Residuals vs Log(total_single_parent)",
+       x = "Log of # Children in Single-parent Households",
+       y = "Standardized Residuals") +
+  theme_minimal()
+```
+
+## Model A - Aside (looking at variables' impact in minor_suicide_rate)
+
+```{r}
+# Running a log-log model with no differences
+model_minors = lm(log(minor_suicide_rate) ~
+               permit + 
+               log_prop_owners + 
+               log_urate + 
+               log_total_single_parent, 
+               data = model1_df)
+print((summary(model_minors)))
+
+    # Looking better, but I will now add clustered standard errors to account for any group-dependence
+cluster_se <- coeftest(model_1, vcov = vcovHC(model_1, type = "HC1", cluster = "group", group = model1_df$State))
+print(cluster_se)
+
+# Pretty Similar
+```
+
+
+
+
+
+## Model B - Testing Policy impact of universal background checks on total homicide rates by state
+```{r}
+model2_df <- data %>%
+  select(Year, State, prop_owners, universl, adult_homicide_rate, minor_homicide_rate,
+         total_homicide_rate, urate, total_single_parent, single_mother, single_father)
+
+model2_df <- model2_df %>%
+  mutate(log_total_homicide_rate = log(total_homicide_rate),
+         log_prop_owners = log(prop_owners),
+         log_urate = log(urate),
+         log_total_single_parent = log(total_single_parent))
+
+
+# Running a log-log model with no differences
+model_3 = lm(log_total_homicide_rate ~
+               universl + 
+               log_prop_owners + 
+               log_urate + 
+               log_total_single_parent, 
+               data = model2_df)
+print((summary(model_3)))
+
+    # Looking better, but I will now add clustered standard errors to account for any group-dependence
+cluster_se3 <- coeftest(model_3, vcov = vcovHC(model_3, type = "HC1", cluster = "group", group = model2_df$State))
+print(cluster_se3)
+```
+
+
+## Model B - Visualized
+```{r}
+# Calculate fitted values
+model2_df$fitted_values = fitted(model_3)
+
+# Plotting
+ggplot(model2_df, aes(x = log_total_homicide_rate, y = fitted_values)) +
+  geom_point(aes(color = State), alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ State) +  # Separate plots for each state
+  labs(title = "Actual vs Fitted Log(Total Homicide Rate) by State",
+       x = "Log of Total Homicide Rate",
+       y = "Fitted Values",
+       color = "State") +
+  theme_minimal()
+```
+
+## Model B - Testing for multicollinearity 
+```{r}
+vif(model_3)
+```
+
+## Model B - Looking for potential heteroskedasticity
+```{r}
+model2_df$std_residuals = rstandard(model_3)
+
+ggplot(model2_df, aes(x = log(prop_owners), y = std_residuals)) +
+  geom_point(aes(color = State), alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype='dashed', color='red') +
+  facet_wrap(~ State) +
+  labs(title = "Standardized Residuals vs Log(Prop Owners) by State",
+       x = "Log(Prop Owners)",
+       y = "Standardized Residuals",
+       color = "State") +
+  theme_minimal()
+```
+```{r}
+ggplot(model2_df, aes(x = log(urate), y = std_residuals)) +
+  geom_point(aes(), alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype='dashed', color='red') +
+  labs(title = "Standardized Residuals vs Log(urate)",
+       x = "Log of Unemployment Rate",
+       y = "Standardized Residuals") +
+  theme_minimal()
+```
+```{r}
+ggplot(model2_df, aes(x = log(total_single_parent), y = std_residuals)) +
+  geom_point(aes(), alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype='dashed', color='red') +
+  labs(title = "Standardized Residuals vs Log(total_single_parent)",
+       x = "Log of # Children in Single-parent Households",
+       y = "Standardized Residuals") +
+  theme_minimal()
+```
+
+
+
